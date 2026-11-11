@@ -250,8 +250,65 @@ def _fetch_betas() -> dict:
     return {"betas": dict(zip(out["industry"], out["beta_u"])), "asof": asof}
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Fetching OECD tax rates...")
-def _fetch_tax() -> dict:
+OECD_SDMX_URLS = [
+    # OECD Corporate Tax Statistics dataflow; version omitted = latest, then explicit versions.
+    "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT/all"
+    "?dimensionAtObservation=AllDimensions&format=csvfilewithlabels",
+    "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/all"
+    "?dimensionAtObservation=AllDimensions&format=csvfilewithlabels",
+    "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,1.0/all"
+    "?dimensionAtObservation=AllDimensions&format=csvfilewithlabels",
+]
+
+
+def parse_oecd_sdmx_csv(text: str) -> tuple[dict, str]:
+    """Parse an OECD SDMX 'csvfilewithlabels' response into ({country: rate %}, year).
+
+    Keeps only rows whose descriptive labels mention a *combined* (central +
+    sub-central) rate, takes the latest year per country, and refuses to guess
+    if no such rows exist (so a wrong measure is never silently used).
+    """
+    df = pd.read_csv(io.StringIO(text), dtype=str)
+    cols = list(df.columns)
+    area_code = next((c for c in cols if c.upper() == "REF_AREA"), None)
+    area_name = next((c for c in cols if c.lower() in ("reference area", "ref_area label")), None)
+    time_col = next((c for c in cols if c.upper() == "TIME_PERIOD"), None)
+    val_col = next((c for c in cols if c.upper() == "OBS_VALUE"), None)
+    if not (area_code and area_name and time_col and val_col):
+        raise ValueError(f"Unexpected SDMX columns: {cols[:12]}")
+    label_cols = [c for c in cols if c not in (area_code, area_name, time_col, val_col)
+                  and df[c].nunique() < 50]
+    blob = df[label_cols].fillna("").astype(str).agg(" | ".join, axis=1).str.lower()
+    df = df[blob.str.contains("combined")].copy()
+    if df.empty:
+        raise ValueError("No 'combined' corporate tax rate rows in the SDMX response.")
+    df = df[df[area_code].str.fullmatch(r"[A-Z]{3}", na=False)]
+    df = df[~df[area_name].str.contains("average|total|union", case=False, na=False)]
+    df["year"] = pd.to_numeric(df[time_col].str[:4], errors="coerce")
+    df["rate"] = pd.to_numeric(df[val_col], errors="coerce")
+    df = df.dropna(subset=["year", "rate"]).sort_values("year")
+    latest = df.groupby(area_name).tail(1)
+    # Values below 1 would be fractions; OECD publishes percent. Reject nonsense.
+    rates = {n: float(v) for n, v in zip(latest[area_name], latest["rate"]) if 0 <= v <= 60}
+    if len(rates) < 20:
+        raise ValueError(f"SDMX data parsed but only {len(rates)} countries found.")
+    return rates, str(int(latest["year"].max()))
+
+
+def _tax_from_sdmx() -> dict:
+    """OECD SDMX API (machine-readable; works where the HTML page is bot-blocked)."""
+    errs = []
+    for url in OECD_SDMX_URLS:
+        try:
+            rates, year = parse_oecd_sdmx_csv(_get(url).text)
+            return {"rates": rates, "asof": f"{year} (OECD SDMX API, combined statutory rate)"}
+        except Exception as e:
+            errs.append(f"{type(e).__name__}: {str(e)[:90]}")
+    raise ValueError("SDMX API: " + " / ".join(errs))
+
+
+def _tax_from_page() -> dict:
+    """Scrape the OECD report page (often returns 403 to cloud servers)."""
     html = _get(URL_OECD).text
     tables = pd.read_html(io.StringIO(html))
     best, best_year, best_n = None, None, 0
@@ -281,6 +338,18 @@ def _fetch_tax() -> dict:
     if len(rates) < 20:
         raise ValueError("OECD table parsed but too few countries.")
     return {"rates": rates, "asof": f"{best_year.strip()} (statutory rates)"}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Fetching OECD tax rates...")
+def _fetch_tax() -> dict:
+    """Try the OECD SDMX API first, then the report page; raise if both fail."""
+    errs = []
+    for fn in (_tax_from_sdmx, _tax_from_page):
+        try:
+            return fn()
+        except Exception as e:
+            errs.append(f"{type(e).__name__}: {str(e)[:160]}")
+    raise ValueError(" | ".join(errs))
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Fetching Damodaran ratings spread...")
@@ -313,26 +382,51 @@ def _fetch_spread() -> dict:
     return {"spread": spread, "asof": asof}
 
 
+def parse_te_bonds(html: str) -> tuple[dict, dict]:
+    """Parse the Trading Economics bond tables into ({norm country: yield %}, {norm: date}).
+
+    Each regional table has an unlabeled flag column FIRST, then the country
+    column (headed by the region name, e.g. 'Europe'), then 'Yield'. So the
+    country column is found as the text-heavy column just before 'Yield',
+    not as column 0.
+    """
+    yields, dates = {}, {}
+    for t in pd.read_html(io.StringIO(html)):
+        cols = [" ".join(map(str, c)) if isinstance(c, tuple) else str(c) for c in t.columns]
+        t = t.copy()
+        t.columns = cols
+        ycol = next((c for c in cols if c.strip().lower() == "yield"), None)
+        if ycol is None:
+            continue
+        before = cols[:cols.index(ycol)]
+
+        def text_cells(c):  # how many cells look like names (not numbers)
+            s = t[c].astype(str).str.strip()
+            return int((s.str.contains(r"[A-Za-z]{3}") & (s.str.lower() != "nan")).sum())
+
+        if not before:
+            continue
+        ccol = max(before, key=text_cells)
+        dcol = next((c for c in cols if c.strip().lower() == "date"), None)
+        for _, r in t.iterrows():
+            name = re.sub(r"\s+", " ", str(r[ccol])).strip()
+            val = _to_number(r[ycol])
+            if name and name.lower() != "nan" and val is not None:
+                yields[_norm(name)] = val
+                if dcol:
+                    dates[_norm(name)] = str(r[dcol]).strip()
+    return yields, dates
+
+
 @st.cache_data(ttl=3600, show_spinner="Fetching 10-year yields...")
 def _fetch_yields() -> dict:
-    html = _get(URL_BONDS).text
-    tables = pd.read_html(io.StringIO(html))
-    yields = {}
-    for t in tables:
-        cols = [str(c) for c in t.columns]
-        ycol = next((c for c in cols if c.strip().lower() == "yield"), None)
-        if ycol is None or len(cols) < 2:
-            continue
-        ccol = cols[0]
-        t.columns = cols
-        for _, r in t.iterrows():
-            name = str(r[ccol]).strip()
-            val = _to_number(r[ycol])
-            if name and val is not None:
-                yields[_norm(name)] = val
+    yields, dates = parse_te_bonds(_get(URL_BONDS).text)
     if "unitedstates" not in yields:
-        raise ValueError("U.S. row not found in the Trading Economics bond table.")
-    return {"yields": yields, "asof": f"retrieved {_now()}"}
+        raise ValueError(f"U.S. row not found in the Trading Economics tables "
+                         f"({len(yields)} rows parsed).")
+    us_date = dates.get("unitedstates", "date n/a")
+    return {"yields": yields, "dates": dates,
+            "asof": f"latest quote {us_date} (U.S.), retrieved {_now()}"}
 
 
 def _safe(fn):
