@@ -21,7 +21,7 @@ No secrets or API keys are needed.
 | Item | Source | Notes |
 |---|---|---|
 | Unlevered beta by U.S. industry | [Damodaran betas.xls](https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls) | Header row is located by searching for "Industry Name"; the plain "Unlevered beta" column is used, never the cash-corrected one. Data date parsed from the file. |
-| Corporate tax rates | [OECD statutory CIT rates](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html) | Largest table with country rows and year columns; latest year with data. If scraping fails, an embedded **approximate** table is used with a visible warning. |
+| Corporate tax rates | [OECD statutory CIT rates](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html) | Tries the OECD SDMX API first (the report page often returns HTTP 403 to cloud servers and has no static table), then the page itself; latest year with data. If both fail, an embedded **approximate** table is used with a visible warning. |
 | USD BBB spread | [Damodaran ratings](https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html) | Baa2/BBB row of the large non-financial firms table, in % over the U.S. 10-year yield. |
 | 10-year yields | [Trading Economics](https://tradingeconomics.com/bonds) | Scraped with a browser User-Agent. Country-name mismatches handled (e.g. Korea / South Korea, Türkiye / Turkey, Czechia / Czech Republic). The page has no date, so "as of" is the retrieval time. |
 
